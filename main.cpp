@@ -5,31 +5,26 @@
 #include <GLFW/glfw3.h>
 #include <pxr/usd/usd/stage.h>
 #include <pxr/usd/usd/primRange.h>
-#include <pxr/base/gf/camera.h>
-#include <pxr/imaging/hd/rendererPluginRegistry.h>
-#include <pxr/imaging/glf/contextCaps.h>
+#include <pxr/usd/usdGeom/mesh.h>
+#include <pxr/usd/usdGeom/xformable.h>
 #include <pxr/usd/usdGeom/xform.h>
 #include <pxr/usd/usdGeom/xformCommonAPI.h>
+#include <pxr/usd/sdf/path.h>
+#include <pxr/base/gf/camera.h>
+#include <pxr/base/gf/vec3f.h>
+#include <pxr/imaging/hd/rendererPluginRegistry.h>
+#include <pxr/imaging/glf/contextCaps.h>
 #include <pxr/usdImaging/usdImagingGL/engine.h>
 #include <mujoco/mujoco.h>
 #include <iostream>
 #include <unordered_map>
-
-PXR_NAMESPACE_USING_DIRECTIVE
-
-
-
-
-#include <pxr/usd/usd/stage.h>
-#include <pxr/usd/usdGeom/mesh.h>
-#include <pxr/usd/usdGeom/xformable.h>
-#include <pxr/base/gf/vec3f.h>
-#include <pxr/usd/sdf/path.h>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include "tinyxml2.h"
 
 using namespace pxr;
+using namespace tinyxml2;
 
 bool ExportUsdStageToMjcf(UsdStageRefPtr stage, const std::string& outputDir, const std::string& xmlFile)
 {
@@ -47,10 +42,22 @@ bool ExportUsdStageToMjcf(UsdStageRefPtr stage, const std::string& outputDir, co
     // 3. 遍历 Stage 所有 prim
     for (UsdPrim prim : stage->Traverse()) {
         UsdGeomMesh mesh(prim);
-        if (!mesh) continue;
+        if (!mesh)
+            continue;
+        VtVec3fArray extent;
+        mesh.UsdGeomBoundable::ComputeExtent(UsdTimeCode::Default(), &extent);
+        
+        GfVec3f min = extent[0];
+        GfVec3f max = extent[1];
+        GfVec3f size = max - min;
+        if (size[2] < 1e-8)
+            continue;
+
+        const char* Name = prim.GetName().GetText();
+        const char* Path = prim.GetPath().GetText();
 
         std::string meshName = "mesh_" + std::to_string(meshCount);
-        std::string objFile = outputDir + "/" + meshName + ".obj";
+        std::string objFile = outputDir + meshName + ".obj";
 
         // 获取顶点
         VtArray<GfVec3f> points;
@@ -111,36 +118,48 @@ bool ExportUsdStageToMjcf(UsdStageRefPtr stage, const std::string& outputDir, co
     return true;
 }
 
-// int main()
-// {
-//     std::string usdFile = "scene.usda";
-//     std::string outputDir = "meshes";
-//     std::string xmlFile = "scene.xml";
-
-//     ExportUsdStageToMjcf(usdFile, outputDir, xmlFile);
-//     return 0;
-// }
-
 // 简单桥接：MuJoCo → USD
 class MjUsdBridge {
 public:
     MjUsdBridge(const std::string& usd_path)
     {
         stage = UsdStage::Open(usd_path);
-        ExportUsdStageToMjcf(stage, "./", "scene.xml");
+
+        XMLDocument doc;
+        XMLElement* mujoco = doc.NewElement("mujoco");
+        doc.InsertFirstChild(mujoco);
+        XMLElement* worldbody = doc.NewElement("worldbody");
+        mujoco->InsertEndChild(worldbody);
+        worldbody->InsertEndChild(Export(stage->GetPrimAtPath(SdfPath("/")), doc));
+        XMLError eResult = doc.SaveFile("scene.xml");
+        if (eResult != XML_SUCCESS)
+            std::cerr << "Error saving XML\n";
 
         // 2. 初始化 MuJoCo 模型
-        mjModel* m = mj_loadXML("scene.xml", nullptr, nullptr, 0);
-        mjData* d = mj_makeData(m);
+        model = mj_loadXML("scene.xml", nullptr, nullptr, 0);
+        data = mj_makeData(model);
 
-        bodyNames = {"mesh_0_body", "mesh_1_body"};
-        primPaths = {SdfPath("/World/mesh_0"), SdfPath("/World/mesh_1")};
+        //bodyNames = {"mesh_0_body", "mesh_1_body"};
+        //primPaths = {SdfPath("/World/mesh_0"), SdfPath("/World/mesh_1")};
     }
 
     ~MjUsdBridge()
     {
-        if (data) mj_deleteData(data);
-        if (model) mj_deleteModel(model);
+        if (data)
+            mj_deleteData(data);
+        if (model)
+            mj_deleteModel(model);
+    }
+
+    XMLElement* Export(const UsdPrim prim, XMLDocument& doc)
+    {
+        XMLElement* elem = doc.NewElement("body");
+        for (UsdPrim child : prim.GetChildren())
+        {
+            XMLElement* child_elem = Export(child, doc);
+            elem->InsertEndChild(child_elem);
+        }
+        return elem;
     }
 
     UsdStageRefPtr GetStage() { return stage; }
